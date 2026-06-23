@@ -192,7 +192,7 @@ app.post(webhookPath, (req, res) => {
 const port = PORT || 3000;
 
 app.listen(port, async () => {
-  console.log(`🚀 Webhook-сервер слушает на порту ${port}`);
+  console.log(`Патриот слушает`);
   try {
     // Сначала удаляем старый вебхук (на случай, если ранее был выставлен
     // неверный URL или одновременно где-то запущен polling) — это
