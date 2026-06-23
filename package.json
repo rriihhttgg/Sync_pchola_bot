@@ -4,12 +4,24 @@
   "description": "Bridge bot between Discord and Telegram",
   "main": "bridge.js",
   "scripts": {
-    "start": "node bridge.js"
+    "start": "node bridge.js",
+    "dev": "node bridge.js"
   },
+  "keywords": [
+    "discord",
+    "telegram",
+    "bot",
+    "bridge"
+  ],
+  "author": "",
+  "license": "MIT",
   "dependencies": {
     "discord.js": "^14.14.1",
     "node-telegram-bot-api": "^0.66.0",
     "axios": "^1.7.0",
     "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
