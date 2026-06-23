@@ -1,7 +1,7 @@
 /**
  * Discord <-> Telegram bridge bot
  *
- * Discord -> Telegram: бот в Discord слушает сообщения в одном канале
+ * Discord --> Telegram: бот в Discord слушает сообщения в одном канале
  *   и пересылает их в Telegram-чат в формате "username: текст".
  *
  * Telegram -> Discord: бот в Telegram слушает сообщения в одном чате
