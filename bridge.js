@@ -34,7 +34,7 @@ const discordClient = new Client({
 });
 
 // ---------- TELEGRAM ----------
-const tgBot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
+const tgBot = new TelegramBot(TELEGRAM_BOT_TOKEN);
 
 // ===== Discord -> Telegram =====
 discordClient.on('messageCreate', async (message) => {
@@ -107,3 +107,19 @@ async function getTelegramAvatarUrl(userId) {
   const file = await tgBot.getFile(fileId);
   return `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${file.file_path}`;
 }
+
+const express = require('express');
+const app = express();
+app.use(express.json());
+
+const PORT = process.env.PORT || 3000;
+
+app.post(`/bot${TELEGRAM_BOT_TOKEN}`, (req, res) => {
+  tgBot.processUpdate(req.body);
+  res.sendStatus(200);
+});
+
+app.listen(PORT, () => {
+  console.log(`Webhook слушает на порту ${PORT}`);
+  tgBot.setWebHook(`https://YOUR_RAILWAY_DOMAIN/bot${TELEGRAM_BOT_TOKEN}`);
+});
