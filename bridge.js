@@ -142,6 +142,30 @@ async function getGuildId() {
 
 // ===== Discord Webhook =====
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Выполняет fetch с автоматическим retry при 429 (rate limit).
+ * Discord возвращает retry_after в секундах.
+ */
+async function fetchWithRetry(url, options, maxRetries = 5) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const res = await fetch(url, options);
+    if (res.status !== 429) return res;
+
+    let retryAfterMs = 500;
+    try {
+      const data = await res.clone().json();
+      retryAfterMs = Math.ceil((data.retry_after ?? 0.5) * 1000) + 100;
+    } catch {}
+
+    console.warn(`Discord rate limit, ждём ${retryAfterMs}мс (попытка ${attempt + 1}/${maxRetries})`);
+    await sleep(retryAfterMs);
+  }
+  // Последняя попытка без перехвата
+  return fetch(url, options);
+}
+
 /**
  * Отправляет сообщение через Discord webhook.
  * Возвращает ID созданного сообщения (если передан webhookUrl с ?wait=true).
@@ -185,7 +209,7 @@ async function sendToDiscordWebhookWithId({
     );
     form.append('files[0]', new Blob([buffer]), name);
 
-    const res = await fetch(webhookUrl, { method: 'POST', body: form });
+    const res = await fetchWithRetry(webhookUrl, { method: 'POST', body: form });
     if (!res.ok) {
       const body = await res.text().catch(() => '');
       throw new Error(`Discord webhook вернул ${res.status}: ${body}`);
@@ -198,9 +222,8 @@ async function sendToDiscordWebhookWithId({
   const chunks = splitMessage(finalContent || '');
   let msgId = null;
   for (let i = 0; i < chunks.length; i++) {
-    // Только первый чанк идёт с ?wait=true
     const url = i === 0 ? webhookUrl : DISCORD_WEBHOOK_URL;
-    const res = await fetch(url, {
+    const res = await fetchWithRetry(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...baseFields, content: chunks[i] }),
@@ -327,11 +350,11 @@ const voiceRecorders = new Map();
 
 /**
  * Конвертирует сырой PCM s16le -> OGG/Opus через ffmpeg-static.
+ * Записывает результат в outPath, возвращает Promise<void>.
  */
-function pcmToOgg(pcmBuffer) {
+function pcmToOgg(pcmBuffer, outPath) {
   return new Promise((resolve, reject) => {
     const tmpIn = path.join(os.tmpdir(), `vc_in_${Date.now()}_${Math.random().toString(36).slice(2)}.pcm`);
-    const tmpOut = path.join(os.tmpdir(), `vc_out_${Date.now()}_${Math.random().toString(36).slice(2)}.ogg`);
 
     fs.writeFileSync(tmpIn, pcmBuffer);
 
@@ -343,27 +366,19 @@ function pcmToOgg(pcmBuffer) {
       '-i', tmpIn,
       '-c:a', 'libopus',
       '-b:a', '64k',
-      tmpOut,
+      outPath,
     ]);
 
-    // Подавляем вывод ffmpeg в stdout/stderr
     ff.stdout.resume();
     ff.stderr.resume();
 
     ff.on('close', (code) => {
       try { fs.unlinkSync(tmpIn); } catch {}
       if (code !== 0) {
-        try { fs.unlinkSync(tmpOut); } catch {}
+        try { fs.unlinkSync(outPath); } catch {}
         return reject(new Error(`ffmpeg завершился с кодом ${code}`));
       }
-      let result;
-      try {
-        result = fs.readFileSync(tmpOut);
-        fs.unlinkSync(tmpOut);
-      } catch (e) {
-        return reject(e);
-      }
-      resolve(result);
+      resolve();
     });
 
     ff.on('error', (err) => {
@@ -390,17 +405,26 @@ async function flushRecording(userId, displayName) {
   const minBytes = SAMPLE_RATE * CHANNELS * 2 * 0.5;
   if (pcmBuffer.length < minBytes) return;
 
+  const tmpOgg = path.join(os.tmpdir(), `tg_voice_${Date.now()}_${Math.random().toString(36).slice(2)}.ogg`);
+
   try {
-    const oggBuffer = await pcmToOgg(pcmBuffer);
+    await pcmToOgg(pcmBuffer, tmpOgg);
+
+    // Отправляем как ReadStream — node-telegram-bot-api надёжно работает с потоком
+    const fileStream = fs.createReadStream(tmpOgg);
     await tgBot.sendVoice(
       TELEGRAM_CHAT_ID,
-      oggBuffer,
+      fileStream,
       { caption: `🎙 ${displayName}` },
       { filename: 'voice.ogg', contentType: 'audio/ogg' }
     );
-    console.log(`Голосовое от ${displayName} → Telegram (${(oggBuffer.length / 1024).toFixed(1)} КБ)`);
+
+    const sizeKb = (fs.statSync(tmpOgg).size / 1024).toFixed(1);
+    console.log(`Голосовое от ${displayName} → Telegram (${sizeKb} КБ)`);
   } catch (err) {
     console.error(`Ошибка отправки голосового (${displayName}):`, err.message);
+  } finally {
+    try { fs.unlinkSync(tmpOgg); } catch {}
   }
 }
 
