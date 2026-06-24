@@ -6,15 +6,37 @@
  *                       подставляя имя и аватарку отправителя из Telegram.
  *
  * Поддержка ответов (reply):
- *   - Discord reply -> Telegram reply (бот отвечает на нужное TG-сообщение)
- *   - Telegram reply -> Discord reply (бот отвечает на нужное Discord-сообщение через webhook)
- *   Маппинг хранится в памяти (Map). При перезапуске сервиса история сбрасывается,
- *   но новые сообщения снова начинают индексироваться.
+ *   - Discord reply -> Telegram reply
+ *   - Telegram reply -> Discord reply (через webhook + jump-link)
+ *
+ * Голос:
+ *   - Telegram voice / video_note -> Discord: пересылается как файл-вложение
+ *   - !sync в текстовом канале Discord: бот заходит в голосовой канал автора
+ *   - Запись участников голосового канала -> Telegram voice:
+ *       старт — пользователь начал говорить,
+ *       конец  — 2 сек тишины, затем OGG отправляется в Telegram
+ *
+ * Railway-совместимо: ffmpeg берётся из пакета ffmpeg-static, нативный sodium не нужен.
  */
+
 require('dotenv').config();
+
 const { Client, GatewayIntentBits, Partials } = require('discord.js');
+const {
+  joinVoiceChannel,
+  getVoiceConnection,
+  VoiceConnectionStatus,
+  entersState,
+  EndBehaviorType,
+} = require('@discordjs/voice');
+const { OpusEncoder } = require('@discordjs/opus');
+const ffmpegPath = require('ffmpeg-static');
 const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
+const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 
 const {
   DISCORD_BOT_TOKEN,
@@ -32,6 +54,7 @@ const discordClient = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildVoiceStates,
   ],
   partials: [Partials.Channel],
 });
@@ -40,18 +63,11 @@ const discordClient = new Client({
 const tgBot = new TelegramBot(TELEGRAM_BOT_TOKEN);
 
 // ---------- Маппинг сообщений (reply-цепочки) ----------
-// discordIdToTgId: Discord message ID -> Telegram message ID
-// tgIdToDiscordId: Telegram message ID -> Discord message ID
-//
-// Хранение в памяти — при перезапуске сбрасывается. Ограничиваем размер,
-// чтобы процесс не рос бесконечно на долгоживущем сервере.
 const MAX_MAP_SIZE = 5000;
-
-const discordIdToTgId = new Map(); // "discordMsgId" -> tgMsgId (number)
-const tgIdToDiscordId = new Map(); // tgMsgId (number) -> "discordMsgId"
+const discordIdToTgId = new Map(); // discordMsgId -> tgMsgId
+const tgIdToDiscordId = new Map(); // tgMsgId -> discordMsgId
 
 function registerMessageIds(discordMsgId, tgMsgId) {
-  // Чистим старые записи при превышении лимита
   if (discordIdToTgId.size >= MAX_MAP_SIZE) {
     const firstKey = discordIdToTgId.keys().next().value;
     const firstVal = discordIdToTgId.get(firstKey);
@@ -85,7 +101,7 @@ async function getTelegramAvatarUrl(userId) {
   }
 }
 
-// ---------- Вспомогательные функции ----------
+// ---------- Утилиты ----------
 
 function sanitizeWebhookUsername(name) {
   let clean = String(name)
@@ -98,9 +114,7 @@ function sanitizeWebhookUsername(name) {
 
 function splitMessage(text, limit = 2000) {
   const chunks = [];
-  for (let i = 0; i < text.length; i += limit) {
-    chunks.push(text.slice(i, i + limit));
-  }
+  for (let i = 0; i < text.length; i += limit) chunks.push(text.slice(i, i + limit));
   return chunks.length ? chunks : [''];
 }
 
@@ -113,64 +127,7 @@ function fileNameFromUrl(url, fallback = 'file') {
   }
 }
 
-// Отправка в Discord через вебхук.
-// replyDiscordMsgId — ID Discord-сообщения, на которое нужно ответить (опционально).
-async function sendToDiscordWebhook({ username, avatarUrl, content, fileUrl, fileName, replyDiscordMsgId }) {
-  const baseFields = {
-    username: sanitizeWebhookUsername(username),
-    avatar_url: avatarUrl || undefined,
-    allowed_mentions: { parse: [] },
-  };
-
-  // Discord Webhooks не поддерживают message_reference напрямую,
-  // поэтому цитируем оригинал через ссылку на сообщение.
-  let finalContent = content || '';
-  if (replyDiscordMsgId) {
-    // Формируем jump-link на оригинальное сообщение
-    const jumpUrl = `https://discord.com/channels/${await getGuildId()}/${DISCORD_CHANNEL_ID}/${replyDiscordMsgId}`;
-    const quoteHeader = `↩️ [ответ на сообщение](${jumpUrl})\n`;
-    finalContent = quoteHeader + finalContent;
-  }
-
-  if (fileUrl) {
-    const fileRes = await fetch(fileUrl);
-    if (!fileRes.ok) throw new Error(`Не удалось скачать файл из Telegram (${fileRes.status})`);
-    const buffer = Buffer.from(await fileRes.arrayBuffer());
-    const name = fileName || 'file';
-
-    const form = new FormData();
-    form.append(
-      'payload_json',
-      JSON.stringify({
-        ...baseFields,
-        content: finalContent ? finalContent.slice(0, 2000) : undefined,
-        attachments: [{ id: 0, filename: name }],
-      })
-    );
-    form.append('files[0]', new Blob([buffer]), name);
-
-    const res = await fetch(DISCORD_WEBHOOK_URL, { method: 'POST', body: form });
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      throw new Error(`Discord webhook вернул ${res.status}: ${body}`);
-    }
-    return;
-  }
-
-  for (const chunk of splitMessage(finalContent || '')) {
-    const res = await fetch(DISCORD_WEBHOOK_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...baseFields, content: chunk }),
-    });
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      throw new Error(`Discord webhook вернул ${res.status}: ${body}`);
-    }
-  }
-}
-
-// Кэш guild ID (нужен для формирования jump-link)
+// ---------- Guild ID (нужен для jump-link в reply) ----------
 let _guildId = null;
 async function getGuildId() {
   if (_guildId) return _guildId;
@@ -183,201 +140,21 @@ async function getGuildId() {
   return _guildId;
 }
 
-// Отправка сообщения в Telegram с опциональным reply
-async function sendTelegramMessage(text, replyToTgMsgId) {
-  const opts = replyToTgMsgId
-    ? { reply_to_message_id: replyToTgMsgId, allow_sending_without_reply: true }
-    : {};
-  return tgBot.sendMessage(TELEGRAM_CHAT_ID, text, opts);
-}
+// ===== Discord Webhook =====
 
-// Отправка медиа в Telegram с опциональным reply
-async function sendDiscordAttachmentToTelegram(att, caption, replyToTgMsgId) {
-  const kind = getDiscordAttachmentKind(att);
-  const opts = {
-    ...(caption ? { caption } : {}),
-    ...(replyToTgMsgId ? { reply_to_message_id: replyToTgMsgId, allow_sending_without_reply: true } : {}),
-  };
-  if (kind === 'photo') {
-    return tgBot.sendPhoto(TELEGRAM_CHAT_ID, att.url, opts);
-  } else if (kind === 'video') {
-    return tgBot.sendVideo(TELEGRAM_CHAT_ID, att.url, opts);
-  } else if (kind === 'animation') {
-    return tgBot.sendAnimation(TELEGRAM_CHAT_ID, att.url, opts);
-  } else {
-    return tgBot.sendDocument(TELEGRAM_CHAT_ID, att.url, opts);
-  }
-}
-
-// ===== Discord -> Telegram =====
-
-function buildTelegramCaption(username, content) {
-  const text = content ? `${username}: ${content}` : username;
-  return text.slice(0, 1024);
-}
-
-function getDiscordAttachmentKind(att) {
-  const type = att.contentType || '';
-  const name = (att.name || '').toLowerCase();
-  if (type === 'image/gif' || name.endsWith('.gif')) return 'animation';
-  if (type.startsWith('image/') || /\.(jpe?g|png|webp)$/.test(name)) return 'photo';
-  if (type.startsWith('video/') || /\.(mp4|mov|webm|mkv)$/.test(name)) return 'video';
-  return 'document';
-}
-
-discordClient.on('messageCreate', async (message) => {
-  if (message.channelId !== DISCORD_CHANNEL_ID) return;
-  if (message.webhookId) return;
-  if (message.author.bot) return;
-
-  const username = message.member?.displayName || message.author.username;
-  const attachments = [...message.attachments.values()];
-
-  if (!message.content && attachments.length === 0) return;
-
-  // Определяем, является ли сообщение ответом на другое
-  const referencedDiscordId = message.reference?.messageId || null;
-  const replyToTgMsgId = referencedDiscordId
-    ? (discordIdToTgId.get(referencedDiscordId) ?? null)
-    : null;
-
-  try {
-    let sentTgMsg = null;
-
-    if (attachments.length === 0) {
-      sentTgMsg = await sendTelegramMessage(`${username}: ${message.content}`, replyToTgMsgId);
-    } else {
-      const caption = buildTelegramCaption(username, message.content);
-      for (let i = 0; i < attachments.length; i++) {
-        // reply только на первое вложение; остальные идут без reply и без подписи
-        const tgMsg = await sendDiscordAttachmentToTelegram(
-          attachments[i],
-          i === 0 ? caption : undefined,
-          i === 0 ? replyToTgMsgId : null
-        );
-        if (i === 0) sentTgMsg = tgMsg;
-      }
-    }
-
-    // Регистрируем маппинг, чтобы на это сообщение можно было ответить из TG
-    if (sentTgMsg?.message_id) {
-      registerMessageIds(message.id, sentTgMsg.message_id);
-    }
-  } catch (err) {
-    console.error('Ошибка отправки в Telegram:', err.message);
-  }
-});
-
-discordClient.once('ready', () => {
-  console.log(`Discord-бот запущен как ${discordClient.user.tag}`);
-});
-discordClient.login(DISCORD_BOT_TOKEN);
-
-// ===== Telegram -> Discord =====
-
-function resolveTelegramFileName(msg, url) {
-  if (msg.document?.file_name) return msg.document.file_name;
-  if (msg.video?.file_name) return msg.video.file_name;
-  return fileNameFromUrl(url);
-}
-
-function extractTelegramMedia(msg) {
-  if (msg.photo && msg.photo.length) {
-    return { fileId: msg.photo[msg.photo.length - 1].file_id };
-  }
-  if (msg.video) return { fileId: msg.video.file_id };
-  if (msg.animation) return { fileId: msg.animation.file_id };
-  if (msg.document) return { fileId: msg.document.file_id };
-  return null;
-}
-
-tgBot.on('message', async (msg) => {
-  if (!msg.chat || msg.chat.id.toString() !== TELEGRAM_CHAT_ID.toString()) return;
-
-  const from = msg.from;
-  if (!from || from.is_bot) return;
-
-  const displayName =
-    [from.first_name, from.last_name].filter(Boolean).join(' ') ||
-    from.username ||
-    'Unknown';
-
-  const text = msg.text || msg.caption || '';
-  const media = extractTelegramMedia(msg);
-
-  if (!text && !media) return;
-
-  // Определяем, является ли сообщение ответом на другое
-  const referencedTgId = msg.reply_to_message?.message_id ?? null;
-  const replyDiscordMsgId = referencedTgId
-    ? (tgIdToDiscordId.get(referencedTgId) ?? null)
-    : null;
-
-  try {
-    let fileUrl = null;
-    let fileName = null;
-    let downloadFailed = false;
-
-    if (media) {
-      try {
-        fileUrl = await tgBot.getFileLink(media.fileId);
-        fileName = resolveTelegramFileName(msg, fileUrl);
-      } catch (err) {
-        downloadFailed = true;
-        console.error('Не удалось получить файл из Telegram (вероятно, больше 20 МБ):', err.message);
-      }
-    }
-
-    const content = downloadFailed
-      ? `${text ? text + '\n' : ''}[не удалось переслать файл — он больше 20 МБ]`
-      : text;
-
-    let sentDiscordMsgId = null;
-
-    if (DISCORD_WEBHOOK_URL) {
-      const avatarUrl = await getTelegramAvatarUrl(from.id);
-      // Webhook не возвращает message ID в обычном режиме — нужно добавить ?wait=true
-      const webhookUrlWithWait = DISCORD_WEBHOOK_URL.includes('?')
-        ? DISCORD_WEBHOOK_URL + '&wait=true'
-        : DISCORD_WEBHOOK_URL + '?wait=true';
-
-      sentDiscordMsgId = await sendToDiscordWebhookWithId({
-        webhookUrl: webhookUrlWithWait,
-        username: displayName,
-        avatarUrl,
-        content,
-        fileUrl,
-        fileName,
-        replyDiscordMsgId,
-      });
-    } else {
-      // Запасной вариант без вебхука
-      const channel = await discordClient.channels.fetch(DISCORD_CHANNEL_ID);
-      const prefix = `**${displayName}**${content ? `: ${content}` : ''}`;
-      const sendOpts = fileUrl
-        ? { content: prefix, files: [{ attachment: fileUrl, name: fileName }] }
-        : { content: prefix };
-
-      // reply через обычный канал поддерживается нативно
-      if (replyDiscordMsgId) {
-        sendOpts.reply = { messageReference: replyDiscordMsgId, failIfNotExists: false };
-      }
-
-      const sent = await channel.send(sendOpts);
-      sentDiscordMsgId = sent.id;
-    }
-
-    // Регистрируем маппинг
-    if (sentDiscordMsgId) {
-      registerMessageIds(sentDiscordMsgId, msg.message_id);
-    }
-  } catch (err) {
-    console.error('Ошибка отправки в Discord:', err.message);
-  }
-});
-
-// Версия sendToDiscordWebhook, которая возвращает ID созданного сообщения
-async function sendToDiscordWebhookWithId({ webhookUrl, username, avatarUrl, content, fileUrl, fileName, replyDiscordMsgId }) {
+/**
+ * Отправляет сообщение через Discord webhook.
+ * Возвращает ID созданного сообщения (если передан webhookUrl с ?wait=true).
+ */
+async function sendToDiscordWebhookWithId({
+  webhookUrl,
+  username,
+  avatarUrl,
+  content,
+  fileUrl,
+  fileName,
+  replyDiscordMsgId,
+}) {
   const baseFields = {
     username: sanitizeWebhookUsername(username),
     avatar_url: avatarUrl || undefined,
@@ -386,13 +163,14 @@ async function sendToDiscordWebhookWithId({ webhookUrl, username, avatarUrl, con
 
   let finalContent = content || '';
   if (replyDiscordMsgId) {
-    const jumpUrl = `https://discord.com/channels/${await getGuildId()}/${DISCORD_CHANNEL_ID}/${replyDiscordMsgId}`;
+    const guildId = await getGuildId();
+    const jumpUrl = `https://discord.com/channels/${guildId}/${DISCORD_CHANNEL_ID}/${replyDiscordMsgId}`;
     finalContent = `↩️ [ответ на сообщение](${jumpUrl})\n` + finalContent;
   }
 
   if (fileUrl) {
     const fileRes = await fetch(fileUrl);
-    if (!fileRes.ok) throw new Error(`Не удалось скачать файл из Telegram (${fileRes.status})`);
+    if (!fileRes.ok) throw new Error(`Не удалось скачать файл (${fileRes.status})`);
     const buffer = Buffer.from(await fileRes.arrayBuffer());
     const name = fileName || 'file';
 
@@ -416,11 +194,11 @@ async function sendToDiscordWebhookWithId({ webhookUrl, username, avatarUrl, con
     return data?.id ?? null;
   }
 
-  // Только первый чанк идёт с ?wait=true и возвращает ID;
-  // последующие (редкие) чанки отправляются без ожидания
+  // Текстовые чанки
   const chunks = splitMessage(finalContent || '');
   let msgId = null;
   for (let i = 0; i < chunks.length; i++) {
+    // Только первый чанк идёт с ?wait=true
     const url = i === 0 ? webhookUrl : DISCORD_WEBHOOK_URL;
     const res = await fetch(url, {
       method: 'POST',
@@ -438,6 +216,388 @@ async function sendToDiscordWebhookWithId({ webhookUrl, username, avatarUrl, con
   }
   return msgId;
 }
+
+// Обёртка без wait (для совместимости со старым кодом)
+async function sendToDiscordWebhook(opts) {
+  return sendToDiscordWebhookWithId({ webhookUrl: DISCORD_WEBHOOK_URL, ...opts });
+}
+
+// ===== Telegram helpers =====
+
+async function sendTelegramMessage(text, replyToTgMsgId) {
+  const opts = replyToTgMsgId
+    ? { reply_to_message_id: replyToTgMsgId, allow_sending_without_reply: true }
+    : {};
+  return tgBot.sendMessage(TELEGRAM_CHAT_ID, text, opts);
+}
+
+function getDiscordAttachmentKind(att) {
+  const type = att.contentType || '';
+  const name = (att.name || '').toLowerCase();
+  if (type === 'image/gif' || name.endsWith('.gif')) return 'animation';
+  if (type.startsWith('image/') || /\.(jpe?g|png|webp)$/.test(name)) return 'photo';
+  if (type.startsWith('video/') || /\.(mp4|mov|webm|mkv)$/.test(name)) return 'video';
+  return 'document';
+}
+
+async function sendDiscordAttachmentToTelegram(att, caption, replyToTgMsgId) {
+  const kind = getDiscordAttachmentKind(att);
+  const opts = {
+    ...(caption ? { caption } : {}),
+    ...(replyToTgMsgId
+      ? { reply_to_message_id: replyToTgMsgId, allow_sending_without_reply: true }
+      : {}),
+  };
+  if (kind === 'photo') return tgBot.sendPhoto(TELEGRAM_CHAT_ID, att.url, opts);
+  if (kind === 'video') return tgBot.sendVideo(TELEGRAM_CHAT_ID, att.url, opts);
+  if (kind === 'animation') return tgBot.sendAnimation(TELEGRAM_CHAT_ID, att.url, opts);
+  return tgBot.sendDocument(TELEGRAM_CHAT_ID, att.url, opts);
+}
+
+function buildTelegramCaption(username, content) {
+  return (content ? `${username}: ${content}` : username).slice(0, 1024);
+}
+
+// ===== Discord -> Telegram (текст + вложения) =====
+
+discordClient.on('messageCreate', async (message) => {
+  if (message.channelId !== DISCORD_CHANNEL_ID) return;
+  if (message.webhookId) return;
+  if (message.author.bot) return;
+
+  // Команда !sync — войти в голосовой канал
+  if (message.content.trim() === '!sync') {
+    const voiceChannel = message.member?.voice?.channel;
+    if (!voiceChannel) {
+      await message.reply('Ты не находишься в голосовом канале.');
+      return;
+    }
+    await joinAndRecord(voiceChannel, message.guild);
+    await message.reply(`Подключился к **${voiceChannel.name}** и начал запись 🎙`);
+    return;
+  }
+
+  const username = message.member?.displayName || message.author.username;
+  const attachments = [...message.attachments.values()];
+  if (!message.content && attachments.length === 0) return;
+
+  const referencedDiscordId = message.reference?.messageId || null;
+  const replyToTgMsgId = referencedDiscordId
+    ? (discordIdToTgId.get(referencedDiscordId) ?? null)
+    : null;
+
+  try {
+    let sentTgMsg = null;
+
+    if (attachments.length === 0) {
+      sentTgMsg = await sendTelegramMessage(`${username}: ${message.content}`, replyToTgMsgId);
+    } else {
+      const caption = buildTelegramCaption(username, message.content);
+      for (let i = 0; i < attachments.length; i++) {
+        const tgMsg = await sendDiscordAttachmentToTelegram(
+          attachments[i],
+          i === 0 ? caption : undefined,
+          i === 0 ? replyToTgMsgId : null
+        );
+        if (i === 0) sentTgMsg = tgMsg;
+      }
+    }
+
+    if (sentTgMsg?.message_id) {
+      registerMessageIds(message.id, sentTgMsg.message_id);
+    }
+  } catch (err) {
+    console.error('Ошибка отправки в Telegram:', err.message);
+  }
+});
+
+discordClient.once('ready', () => {
+  console.log(`Discord-бот запущен как ${discordClient.user.tag}`);
+});
+discordClient.login(DISCORD_BOT_TOKEN);
+
+// ===== Запись голосового канала Discord -> Telegram =====
+
+const SILENCE_TIMEOUT_MS = 2000;
+const SAMPLE_RATE = 48000;
+const CHANNELS = 2;
+
+// userId -> { pcmChunks: Buffer[], silenceTimer: Timeout|null }
+const voiceRecorders = new Map();
+
+/**
+ * Конвертирует сырой PCM s16le -> OGG/Opus через ffmpeg-static.
+ */
+function pcmToOgg(pcmBuffer) {
+  return new Promise((resolve, reject) => {
+    const tmpIn = path.join(os.tmpdir(), `vc_in_${Date.now()}_${Math.random().toString(36).slice(2)}.pcm`);
+    const tmpOut = path.join(os.tmpdir(), `vc_out_${Date.now()}_${Math.random().toString(36).slice(2)}.ogg`);
+
+    fs.writeFileSync(tmpIn, pcmBuffer);
+
+    const ff = spawn(ffmpegPath, [
+      '-y',
+      '-f', 's16le',
+      '-ar', String(SAMPLE_RATE),
+      '-ac', String(CHANNELS),
+      '-i', tmpIn,
+      '-c:a', 'libopus',
+      '-b:a', '64k',
+      tmpOut,
+    ]);
+
+    // Подавляем вывод ffmpeg в stdout/stderr
+    ff.stdout.resume();
+    ff.stderr.resume();
+
+    ff.on('close', (code) => {
+      try { fs.unlinkSync(tmpIn); } catch {}
+      if (code !== 0) {
+        try { fs.unlinkSync(tmpOut); } catch {}
+        return reject(new Error(`ffmpeg завершился с кодом ${code}`));
+      }
+      let result;
+      try {
+        result = fs.readFileSync(tmpOut);
+        fs.unlinkSync(tmpOut);
+      } catch (e) {
+        return reject(e);
+      }
+      resolve(result);
+    });
+
+    ff.on('error', (err) => {
+      try { fs.unlinkSync(tmpIn); } catch {}
+      reject(err);
+    });
+  });
+}
+
+/**
+ * Завершает запись для userId, конвертирует и отправляет голосовое в Telegram.
+ */
+async function flushRecording(userId, displayName) {
+  const rec = voiceRecorders.get(userId);
+  if (!rec || rec.pcmChunks.length === 0) {
+    voiceRecorders.delete(userId);
+    return;
+  }
+
+  const pcmBuffer = Buffer.concat(rec.pcmChunks);
+  voiceRecorders.delete(userId);
+
+  // Минимум 0.5 секунды, иначе не отправляем
+  const minBytes = SAMPLE_RATE * CHANNELS * 2 * 0.5;
+  if (pcmBuffer.length < minBytes) return;
+
+  try {
+    const oggBuffer = await pcmToOgg(pcmBuffer);
+    await tgBot.sendVoice(
+      TELEGRAM_CHAT_ID,
+      oggBuffer,
+      { caption: `🎙 ${displayName}` },
+      { filename: 'voice.ogg', contentType: 'audio/ogg' }
+    );
+    console.log(`Голосовое от ${displayName} → Telegram (${(oggBuffer.length / 1024).toFixed(1)} КБ)`);
+  } catch (err) {
+    console.error(`Ошибка отправки голосового (${displayName}):`, err.message);
+  }
+}
+
+/**
+ * Подключается к голосовому каналу и начинает запись участников.
+ */
+async function joinAndRecord(voiceChannel, guild) {
+  // Если уже подключены — отключаемся
+  const existing = getVoiceConnection(guild.id);
+  if (existing) {
+    existing.destroy();
+    voiceRecorders.clear();
+  }
+
+  const connection = joinVoiceChannel({
+    channelId: voiceChannel.id,
+    guildId: guild.id,
+    adapterCreator: guild.voiceAdapterCreator,
+    selfDeaf: false,
+    selfMute: true,
+  });
+
+  try {
+    await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
+    console.log(`Подключился к голосовому каналу: ${voiceChannel.name}`);
+  } catch (err) {
+    console.error('Не удалось подключиться к голосовому каналу:', err.message);
+    connection.destroy();
+    return;
+  }
+
+  const receiver = connection.receiver;
+  const encoder = new OpusEncoder(SAMPLE_RATE, CHANNELS);
+
+  receiver.speaking.on('start', (userId) => {
+    const member = voiceChannel.guild.members.cache.get(userId);
+    const displayName = member?.displayName || member?.user?.username || String(userId);
+
+    // Если уже пишем — сбрасываем таймер тишины (человек снова заговорил)
+    if (voiceRecorders.has(userId)) {
+      const rec = voiceRecorders.get(userId);
+      if (rec.silenceTimer) {
+        clearTimeout(rec.silenceTimer);
+        rec.silenceTimer = null;
+      }
+    } else {
+      voiceRecorders.set(userId, { pcmChunks: [], silenceTimer: null });
+    }
+
+    const rec = voiceRecorders.get(userId);
+
+    // Подписываемся на аудио-поток
+    const audioStream = receiver.subscribe(userId, {
+      end: { behavior: EndBehaviorType.AfterSilence, duration: 100 },
+    });
+
+    audioStream.on('data', (opusPacket) => {
+      try {
+        const pcm = encoder.decode(opusPacket);
+        rec.pcmChunks.push(pcm);
+      } catch {
+        // битый пакет — пропускаем
+      }
+    });
+
+    audioStream.on('end', () => {
+      if (!voiceRecorders.has(userId)) return;
+      const r = voiceRecorders.get(userId);
+      if (r.silenceTimer) clearTimeout(r.silenceTimer);
+      r.silenceTimer = setTimeout(() => {
+        flushRecording(userId, displayName);
+      }, SILENCE_TIMEOUT_MS);
+    });
+  });
+
+  // Автоматическое переподключение при обрыве
+  connection.on(VoiceConnectionStatus.Disconnected, async () => {
+    try {
+      await Promise.race([
+        entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+        entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+      ]);
+    } catch {
+      connection.destroy();
+      voiceRecorders.clear();
+      console.log('Отключился от голосового канала.');
+    }
+  });
+}
+
+// ===== Telegram -> Discord =====
+
+function resolveTelegramFileName(msg, url) {
+  if (msg.document?.file_name) return msg.document.file_name;
+  if (msg.video?.file_name) return msg.video.file_name;
+  return fileNameFromUrl(url);
+}
+
+function extractTelegramMedia(msg) {
+  if (msg.voice)      return { fileId: msg.voice.file_id,      kind: 'voice' };
+  if (msg.video_note) return { fileId: msg.video_note.file_id, kind: 'video_note' };
+  if (msg.photo?.length)
+    return { fileId: msg.photo[msg.photo.length - 1].file_id, kind: 'photo' };
+  if (msg.video)     return { fileId: msg.video.file_id,     kind: 'video' };
+  if (msg.animation) return { fileId: msg.animation.file_id, kind: 'animation' };
+  if (msg.document)  return { fileId: msg.document.file_id,  kind: 'document' };
+  return null;
+}
+
+tgBot.on('message', async (msg) => {
+  if (!msg.chat || msg.chat.id.toString() !== TELEGRAM_CHAT_ID.toString()) return;
+
+  const from = msg.from;
+  if (!from || from.is_bot) return;
+
+  const displayName =
+    [from.first_name, from.last_name].filter(Boolean).join(' ') ||
+    from.username ||
+    'Unknown';
+
+  const text = msg.text || msg.caption || '';
+  const media = extractTelegramMedia(msg);
+  if (!text && !media) return;
+
+  const referencedTgId = msg.reply_to_message?.message_id ?? null;
+  const replyDiscordMsgId = referencedTgId
+    ? (tgIdToDiscordId.get(referencedTgId) ?? null)
+    : null;
+
+  try {
+    let fileUrl = null;
+    let fileName = null;
+    let downloadFailed = false;
+
+    if (media) {
+      try {
+        fileUrl = await tgBot.getFileLink(media.fileId);
+
+        if (media.kind === 'voice') {
+          fileName = `voice_${from.id}_${msg.message_id}.ogg`;
+        } else if (media.kind === 'video_note') {
+          fileName = `video_note_${from.id}_${msg.message_id}.mp4`;
+        } else {
+          fileName = resolveTelegramFileName(msg, fileUrl);
+        }
+      } catch (err) {
+        downloadFailed = true;
+        console.error('Не удалось получить файл из Telegram (> 20 МБ?):', err.message);
+      }
+    }
+
+    let content = downloadFailed
+      ? `${text ? text + '\n' : ''}[не удалось переслать файл — он больше 20 МБ]`
+      : text;
+
+    if (media?.kind === 'voice'      && !content) content = '🎙 Голосовое сообщение';
+    if (media?.kind === 'video_note' && !content) content = '⭕ Видео-кружок';
+
+    let sentDiscordMsgId = null;
+
+    if (DISCORD_WEBHOOK_URL) {
+      const avatarUrl = await getTelegramAvatarUrl(from.id);
+      const webhookUrlWithWait = DISCORD_WEBHOOK_URL.includes('?')
+        ? DISCORD_WEBHOOK_URL + '&wait=true'
+        : DISCORD_WEBHOOK_URL + '?wait=true';
+
+      sentDiscordMsgId = await sendToDiscordWebhookWithId({
+        webhookUrl: webhookUrlWithWait,
+        username: displayName,
+        avatarUrl,
+        content,
+        fileUrl,
+        fileName,
+        replyDiscordMsgId,
+      });
+    } else {
+      const channel = await discordClient.channels.fetch(DISCORD_CHANNEL_ID);
+      const prefix = `**${displayName}**${content ? `: ${content}` : ''}`;
+      const sendOpts = fileUrl
+        ? { content: prefix, files: [{ attachment: fileUrl, name: fileName }] }
+        : { content: prefix };
+
+      if (replyDiscordMsgId) {
+        sendOpts.reply = { messageReference: replyDiscordMsgId, failIfNotExists: false };
+      }
+
+      const sent = await channel.send(sendOpts);
+      sentDiscordMsgId = sent.id;
+    }
+
+    if (sentDiscordMsgId) {
+      registerMessageIds(sentDiscordMsgId, msg.message_id);
+    }
+  } catch (err) {
+    console.error('Ошибка отправки в Discord:', err.message);
+  }
+});
 
 // ===== Express + Telegram Webhook =====
 const app = express();
