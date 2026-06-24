@@ -435,11 +435,16 @@ async function joinAndRecord(voiceChannel, guild) {
   const receiver = connection.receiver;
   const encoder = new OpusEncoder(SAMPLE_RATE, CHANNELS);
 
+  // Множество userId, для которых уже открыт аудио-стрим в этой сессии.
+  // Нужно чтобы не открывать второй стрим если speaking.start сработал повторно
+  // пока стрим ещё жив.
+  const activeStreams = new Set();
+
   receiver.speaking.on('start', (userId) => {
     const member = voiceChannel.guild.members.cache.get(userId);
     const displayName = member?.displayName || member?.user?.username || String(userId);
 
-    // Если уже пишем — сбрасываем таймер тишины (человек снова заговорил)
+    // Если буфер уже есть — просто сбрасываем таймер тишины и продолжаем писать
     if (voiceRecorders.has(userId)) {
       const rec = voiceRecorders.get(userId);
       if (rec.silenceTimer) {
@@ -447,17 +452,34 @@ async function joinAndRecord(voiceChannel, guild) {
         rec.silenceTimer = null;
       }
     } else {
-      voiceRecorders.set(userId, { pcmChunks: [], silenceTimer: null });
+      voiceRecorders.set(userId, { pcmChunks: [], silenceTimer: null, displayName });
     }
 
-    const rec = voiceRecorders.get(userId);
+    // Не открываем второй стрим если уже есть активный
+    if (activeStreams.has(userId)) return;
+    activeStreams.add(userId);
 
-    // Подписываемся на аудио-поток
+    // Manual — стрим живёт пока мы сами его не закроем.
+    // Тишину отслеживаем через таймер, который сбрасывается на каждом пакете.
     const audioStream = receiver.subscribe(userId, {
-      end: { behavior: EndBehaviorType.AfterSilence, duration: 100 },
+      end: { behavior: EndBehaviorType.Manual },
     });
 
     audioStream.on('data', (opusPacket) => {
+      const rec = voiceRecorders.get(userId);
+      if (!rec) return;
+
+      // Сбрасываем таймер тишины при каждом новом пакете
+      if (rec.silenceTimer) {
+        clearTimeout(rec.silenceTimer);
+      }
+      rec.silenceTimer = setTimeout(() => {
+        // 2 сек тишины — завершаем стрим и отправляем
+        audioStream.destroy();
+        activeStreams.delete(userId);
+        flushRecording(userId, displayName);
+      }, SILENCE_TIMEOUT_MS);
+
       try {
         const pcm = encoder.decode(opusPacket);
         rec.pcmChunks.push(pcm);
@@ -466,15 +488,25 @@ async function joinAndRecord(voiceChannel, guild) {
       }
     });
 
-    audioStream.on('end', () => {
-      if (!voiceRecorders.has(userId)) return;
-      const r = voiceRecorders.get(userId);
-      if (r.silenceTimer) clearTimeout(r.silenceTimer);
-      r.silenceTimer = setTimeout(() => {
-        flushRecording(userId, displayName);
-      }, SILENCE_TIMEOUT_MS);
+    audioStream.on('close', () => {
+      activeStreams.delete(userId);
+    });
+
+    audioStream.on('error', () => {
+      activeStreams.delete(userId);
     });
   });
+
+  // При дисконнекте — сбрасываем все незавершённые записи перед уничтожением
+  async function flushAllAndDestroy() {
+    const flushPromises = [];
+    for (const [uid, rec] of voiceRecorders.entries()) {
+      if (rec.silenceTimer) clearTimeout(rec.silenceTimer);
+      flushPromises.push(flushRecording(uid, rec.displayName));
+    }
+    await Promise.allSettled(flushPromises);
+    activeStreams.clear();
+  }
 
   // Автоматическое переподключение при обрыве
   connection.on(VoiceConnectionStatus.Disconnected, async () => {
@@ -484,10 +516,9 @@ async function joinAndRecord(voiceChannel, guild) {
         entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
       ]);
     } catch {
+      await flushAllAndDestroy();
       connection.destroy();
-      voiceRecorders.clear();
       console.log('Отключился от голосового канала.');
-    }
   });
 }
 
