@@ -650,4 +650,4 @@ app.listen(port, () => {
   } else {
     console.warn('WEBHOOK_DOMAIN не задан — Telegram webhook не установлен');
   }
-});
+};
