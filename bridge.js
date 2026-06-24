@@ -113,6 +113,76 @@ function fileNameFromUrl(url, fallback = 'file') {
   }
 }
 
+// Отправка в Discord через вебхук.
+// replyDiscordMsgId — ID Discord-сообщения, на которое нужно ответить (опционально).
+async function sendToDiscordWebhook({ username, avatarUrl, content, fileUrl, fileName, replyDiscordMsgId }) {
+  const baseFields = {
+    username: sanitizeWebhookUsername(username),
+    avatar_url: avatarUrl || undefined,
+    allowed_mentions: { parse: [] },
+  };
+
+  // Discord Webhooks не поддерживают message_reference напрямую,
+  // поэтому цитируем оригинал через ссылку на сообщение.
+  let finalContent = content || '';
+  if (replyDiscordMsgId) {
+    // Формируем jump-link на оригинальное сообщение
+    const jumpUrl = `https://discord.com/channels/${await getGuildId()}/${DISCORD_CHANNEL_ID}/${replyDiscordMsgId}`;
+    const quoteHeader = `↩️ [ответ на сообщение](${jumpUrl})\n`;
+    finalContent = quoteHeader + finalContent;
+  }
+
+  if (fileUrl) {
+    const fileRes = await fetch(fileUrl);
+    if (!fileRes.ok) throw new Error(`Не удалось скачать файл из Telegram (${fileRes.status})`);
+    const buffer = Buffer.from(await fileRes.arrayBuffer());
+    const name = fileName || 'file';
+
+    const form = new FormData();
+    form.append(
+      'payload_json',
+      JSON.stringify({
+        ...baseFields,
+        content: finalContent ? finalContent.slice(0, 2000) : undefined,
+        attachments: [{ id: 0, filename: name }],
+      })
+    );
+    form.append('files[0]', new Blob([buffer]), name);
+
+    const res = await fetch(DISCORD_WEBHOOK_URL, { method: 'POST', body: form });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`Discord webhook вернул ${res.status}: ${body}`);
+    }
+    return;
+  }
+
+  for (const chunk of splitMessage(finalContent || '')) {
+    const res = await fetch(DISCORD_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...baseFields, content: chunk }),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`Discord webhook вернул ${res.status}: ${body}`);
+    }
+  }
+}
+
+// Кэш guild ID (нужен для формирования jump-link)
+let _guildId = null;
+async function getGuildId() {
+  if (_guildId) return _guildId;
+  try {
+    const channel = await discordClient.channels.fetch(DISCORD_CHANNEL_ID);
+    _guildId = channel.guildId;
+  } catch {
+    _guildId = '@me';
+  }
+  return _guildId;
+}
+
 // Отправка сообщения в Telegram с опциональным reply
 async function sendTelegramMessage(text, replyToTgMsgId) {
   const opts = replyToTgMsgId
@@ -264,22 +334,9 @@ tgBot.on('message', async (msg) => {
 
     let sentDiscordMsgId = null;
 
-    if (replyDiscordMsgId) {
-      // Discord Webhook не поддерживает message_reference, поэтому reply
-      // отправляем через обычного бота. Имя и аватар подставить нельзя —
-      // компенсируем жирным именем в тексте: **Имя**: текст
-      const channel = await discordClient.channels.fetch(DISCORD_CHANNEL_ID);
-      const prefix = `**${displayName}**${content ? `: ${content}` : ''}`;
-      const sendOpts = {
-        content: prefix,
-        ...(fileUrl ? { files: [{ attachment: fileUrl, name: fileName }] } : {}),
-        reply: { messageReference: replyDiscordMsgId, failIfNotExists: false },
-      };
-      const sent = await channel.send(sendOpts);
-      sentDiscordMsgId = sent.id;
-    } else if (DISCORD_WEBHOOK_URL) {
-      // Обычное сообщение — через вебхук (красиво: имя + аватар)
+    if (DISCORD_WEBHOOK_URL) {
       const avatarUrl = await getTelegramAvatarUrl(from.id);
+      // Webhook не возвращает message ID в обычном режиме — нужно добавить ?wait=true
       const webhookUrlWithWait = DISCORD_WEBHOOK_URL.includes('?')
         ? DISCORD_WEBHOOK_URL + '&wait=true'
         : DISCORD_WEBHOOK_URL + '?wait=true';
@@ -291,14 +348,21 @@ tgBot.on('message', async (msg) => {
         content,
         fileUrl,
         fileName,
+        replyDiscordMsgId,
       });
     } else {
-      // Запасной вариант: вебхук не настроен, reply нет — просто бот
+      // Запасной вариант без вебхука
       const channel = await discordClient.channels.fetch(DISCORD_CHANNEL_ID);
       const prefix = `**${displayName}**${content ? `: ${content}` : ''}`;
       const sendOpts = fileUrl
         ? { content: prefix, files: [{ attachment: fileUrl, name: fileName }] }
         : { content: prefix };
+
+      // reply через обычный канал поддерживается нативно
+      if (replyDiscordMsgId) {
+        sendOpts.reply = { messageReference: replyDiscordMsgId, failIfNotExists: false };
+      }
+
       const sent = await channel.send(sendOpts);
       sentDiscordMsgId = sent.id;
     }
@@ -312,16 +376,19 @@ tgBot.on('message', async (msg) => {
   }
 });
 
-// Версия sendToDiscordWebhook, которая возвращает ID созданного сообщения.
-// Вызывается только для обычных сообщений (без reply) — reply идут через бота.
-async function sendToDiscordWebhookWithId({ webhookUrl, username, avatarUrl, content, fileUrl, fileName }) {
+// Версия sendToDiscordWebhook, которая возвращает ID созданного сообщения
+async function sendToDiscordWebhookWithId({ webhookUrl, username, avatarUrl, content, fileUrl, fileName, replyDiscordMsgId }) {
   const baseFields = {
     username: sanitizeWebhookUsername(username),
     avatar_url: avatarUrl || undefined,
     allowed_mentions: { parse: [] },
   };
 
-  const finalContent = content || '';
+  let finalContent = content || '';
+  if (replyDiscordMsgId) {
+    const jumpUrl = `https://discord.com/channels/${await getGuildId()}/${DISCORD_CHANNEL_ID}/${replyDiscordMsgId}`;
+    finalContent = `↩️ [ответ на сообщение](${jumpUrl})\n` + finalContent;
+  }
 
   if (fileUrl) {
     const fileRes = await fetch(fileUrl);
