@@ -519,6 +519,7 @@ async function joinAndRecord(voiceChannel, guild) {
       await flushAllAndDestroy();
       connection.destroy();
       console.log('Отключился от голосового канала.');
+    }
   });
 }
 
@@ -650,4 +651,4 @@ app.listen(port, () => {
   } else {
     console.warn('WEBHOOK_DOMAIN не задан — Telegram webhook не установлен');
   }
-};
+});
