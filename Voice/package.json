@@ -1,0 +1,16 @@
+{
+  "name": "voice-time-bot",
+  "version": "1.0.0",
+  "description": "Discord bot that tracks voice chat time",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}
