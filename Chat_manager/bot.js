@@ -448,9 +448,20 @@ client.on("messageCreate", async (message) => {
   if (cmd === "roll_bee") {
     if (!beePack()) return;
     beeData = loadJSON(BEE_FILE, {});
-    const bee = rollBee();
     const u = getBeeUser(authorId);
-    if (!u.lastCollect) u.lastCollect = new Date().toISOString();
+    const ROLL_COOLDOWN = 3600000; // 1 час в мс
+    const now = Date.now();
+    const lastRoll = u.lastRoll ? new Date(u.lastRoll).getTime() : 0;
+    const elapsed = now - lastRoll;
+    if (elapsed < ROLL_COOLDOWN) {
+      const remaining = ROLL_COOLDOWN - elapsed;
+      const mm = Math.floor(remaining / 60000);
+      const ss = Math.floor((remaining % 60000) / 1000);
+      return message.reply(`⏳ Следующий ролл через **${mm}м ${ss}с**`);
+    }
+    const bee = rollBee();
+    if (!u.lastCollect) u.lastCollect = new Date(now).toISOString();
+    u.lastRoll = new Date(now).toISOString();
     u.bees.push({ name: bee.name, emoji: bee.emoji });
     saveBeeData();
     const rarity = bee.chance >= 20 ? "Обычная" : bee.chance >= 5 ? "Редкая" : bee.chance >= 1 ? "Эпическая" : "Легендарная";
