@@ -157,7 +157,7 @@ client.on("messageCreate", async (message) => {
     );
   }
 
-  // !getvoice — скачать файлы
+  // !getvoice — скачать файлы (txt + json)
   if (cmd === "!getvoice") {
     const rows = getCombined(message.guild);
     if (rows.length === 0) {
@@ -184,16 +184,13 @@ client.on("messageCreate", async (message) => {
     txtLines.push("=".repeat(42), `Всего участников: ${rows.length}`);
     const txtBuffer = Buffer.from(txtLines.join("\n"), "utf-8");
 
-    // JSON
+    // JSON — этот файл можно редактировать и загрузить обратно через !loadvoice
     const jsonPayload = {
       generated_at: nowStr,
-      total_members: rows.length,
-      stats: rows.map(({ userId, secs, name }, i) => ({
-        rank: i + 1,
+      stats: rows.map(({ userId, secs, name }) => ({
         user_id: userId,
         display_name: name,
         total_seconds: Math.round(secs * 10) / 10,
-        formatted: formatTime(secs),
       })),
     };
     const jsonBuffer = Buffer.from(
@@ -202,12 +199,55 @@ client.on("messageCreate", async (message) => {
     );
 
     return message.channel.send({
-      content: `📁 Статистика голосовых чатов на **${nowStr}**`,
+      content: `📁 Статистика на **${nowStr}**\nЧтобы загрузить отредактированный файл обратно — используй **!loadvoice** и прикрепи JSON файл.`,
       files: [
         new AttachmentBuilder(txtBuffer, { name: `voice_stats_${dateTag}.txt` }),
         new AttachmentBuilder(jsonBuffer, { name: `voice_stats_${dateTag}.json` }),
       ],
     });
+  }
+
+  // !loadvoice — загрузить статистику из прикреплённого JSON файла (только администратор)
+  if (cmd === "!loadvoice") {
+    if (!message.member.permissions.has("Administrator")) {
+      return message.channel.send("❌ Эта команда только для администраторов.");
+    }
+
+    const attachment = message.attachments.first();
+    if (!attachment || !attachment.name.endsWith(".json")) {
+      return message.channel.send(
+        "📎 Прикрепи JSON файл к сообщению с командой **!loadvoice**."
+      );
+    }
+
+    try {
+      const res = await fetch(attachment.url);
+      const text = await res.text();
+      const parsed = JSON.parse(text);
+
+      if (!parsed.stats || !Array.isArray(parsed.stats)) {
+        return message.channel.send("❌ Неверный формат файла. Нужен JSON с полем `stats`.");
+      }
+
+      // Очищаем текущие данные и загружаем из файла
+      for (const key of Object.keys(voiceData)) delete voiceData[key];
+
+      let count = 0;
+      for (const entry of parsed.stats) {
+        if (entry.user_id && typeof entry.total_seconds === "number") {
+          voiceData[entry.user_id] = entry.total_seconds;
+          count++;
+        }
+      }
+
+      console.log(`📥 Загружено ${count} записей из файла`);
+      return message.channel.send(
+        `✅ Загружено **${count}** участников из файла. Текущие сессии продолжают считаться поверх загруженных данных.`
+      );
+    } catch (err) {
+      console.error("Ошибка загрузки файла:", err);
+      return message.channel.send("❌ Не удалось прочитать файл. Убедись что это правильный JSON.");
+    }
   }
 
   // !resetvoice — сброс (только администратор)
