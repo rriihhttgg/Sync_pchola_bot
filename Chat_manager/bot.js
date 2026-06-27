@@ -7,7 +7,8 @@ const {
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
-  REST,require("dotenv").config();
+  REST,
+  require("dotenv").config();
 const {
   Client,
   GatewayIntentBits,
