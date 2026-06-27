@@ -321,6 +321,10 @@ client.on("messageCreate", async (message) => {
       reason  = args.slice(2).join(" ") || "Не указана";
     }
     if (!target) return message.reply("❌ Пользователь не найден.");
+    if (target.user.id === authorId) return message.reply("❌ Нельзя замутить самого себя.");
+    if (target.user.bot) return message.reply("❌ Нельзя замутить бота.");
+    if (rankIndex(getRank(target.user.id)) >= rankIndex(getRank(authorId)) && target.user.id !== authorId)
+      return message.reply("❌ Нельзя замутить пользователя с таким же или более высоким рангом.");
     const ms = parseTime(timeStr);
     if (!ms) return message.reply("❌ Укажи время: `1h30m`, `45m`, `90s`");
     try {
@@ -336,6 +340,9 @@ client.on("messageCreate", async (message) => {
     if (!hasRank(authorId, "B") && !hasCatRank(authorId)) return message.reply("❌ Нужен ранг **B** или выше.");
     const target = await resolveTarget(0);
     if (!target) return message.reply("❌ Пользователь не найден.");
+    if (target.user.id === authorId) return message.reply("❌ Нельзя снять мут с самого себя.");
+    if (rankIndex(getRank(target.user.id)) >= rankIndex(getRank(authorId)))
+      return message.reply("❌ Нельзя снять мут у пользователя с таким же или более высоким рангом.");
     try {
       await target.timeout(null);
       return message.channel.send({ embeds: [new EmbedBuilder().setTitle("🔊 Мут снят").setColor(0x57f287)
@@ -349,6 +356,10 @@ client.on("messageCreate", async (message) => {
     if (message.reference) { target = await resolveTarget(); reason = args.join(" ") || "Не указана"; }
     else { target = await resolveTarget(0); reason = args.slice(1).join(" ") || "Не указана"; }
     if (!target) return message.reply("❌ Пользователь не найден.");
+    if (target.user.id === authorId) return message.reply("❌ Нельзя забанить самого себя.");
+    if (target.user.bot) return message.reply("❌ Нельзя забанить бота.");
+    if (rankIndex(getRank(target.user.id)) >= rankIndex(getRank(authorId)))
+      return message.reply("❌ Нельзя забанить пользователя с таким же или более высоким рангом.");
     try {
       await target.ban({ reason });
       return message.channel.send({ embeds: [new EmbedBuilder().setTitle("🔨 Бан выдан").setColor(0xed4245)
@@ -386,6 +397,10 @@ client.on("messageCreate", async (message) => {
     if (message.reference) { target = await resolveTarget(); reason = args.join(" ") || "Не указана"; }
     else { target = await resolveTarget(0); reason = args.slice(1).join(" ") || "Не указана"; }
     if (!target) return message.reply("❌ Пользователь не найден.");
+    if (target.user.id === authorId) return message.reply("❌ Нельзя кикнуть самого себя.");
+    if (target.user.bot) return message.reply("❌ Нельзя кикнуть бота.");
+    if (rankIndex(getRank(target.user.id)) >= rankIndex(getRank(authorId)))
+      return message.reply("❌ Нельзя кикнуть пользователя с таким же или более высоким рангом.");
     try {
       await target.kick(reason);
       return message.channel.send({ embeds: [new EmbedBuilder().setTitle("👢 Кик выдан").setColor(0xe67e22)
@@ -403,6 +418,7 @@ client.on("messageCreate", async (message) => {
     const target = await resolveTarget(0);
     if (!target) return message.reply("❌ Пользователь не найден.");
     const tid = target.user.id;
+    if (tid === authorId) return message.reply("❌ Нельзя повысить самого себя.");
     const cur = getRank(tid);
     if (cur === "cat") return message.reply("❌ Нельзя повышать ранг **cat** через `!up`. Используй `!set_rank`.");
     const nxt = rankUpOf(cur);
@@ -419,6 +435,9 @@ client.on("messageCreate", async (message) => {
     const target = await resolveTarget(0);
     if (!target) return message.reply("❌ Пользователь не найден.");
     const tid = target.user.id;
+    if (tid === authorId) return message.reply("❌ Нельзя понизить самого себя.");
+    if (rankIndex(getRank(tid)) >= rankIndex(getRank(authorId)) && !hasRank(authorId, "S"))
+      return message.reply("❌ Нельзя понизить пользователя с таким же или более высоким рангом.");
     if (getRank(tid) === "S" && !hasRank(authorId, "S"))
       return message.reply("❌ Нельзя понижать **S** ранг.");
     if (getRank(tid) === "cat") return message.reply("❌ Нельзя понижать ранг **cat** через `!down`. Используй `!set_rank`.");
@@ -443,6 +462,7 @@ client.on("messageCreate", async (message) => {
     }
 
     if (!target) return message.reply("❌ Пользователь не найден.");
+    if (target.user.id === authorId) return message.reply("❌ Нельзя изменить свой собственный ранг.");
 
     const rankArgUp = rankArg?.toUpperCase();
     const validRanks = [...RANK_ORDER.map(r => r.toLowerCase()), "cat"];
